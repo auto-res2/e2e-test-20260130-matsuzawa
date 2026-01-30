@@ -10,7 +10,6 @@ import numpy as np
 import optuna
 import torch
 import torch.nn.functional as F
-from hydra import compose, initialize_config_dir
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -88,8 +87,7 @@ def load_run_config(cfg: DictConfig) -> DictConfig:
     run_path = config_dir / "runs" / f"{run_id}.yaml"
     if not run_path.exists():
         raise FileNotFoundError(f"Run config not found: {run_path}")
-    with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):
-        run_cfg = compose(config_name=f"runs/{run_id}")
+    run_cfg = OmegaConf.load(run_path)
     merged = OmegaConf.merge(cfg, run_cfg)
     merged.run_name = run_id
     merged.run = OmegaConf.create({"run_id": run_cfg.get("run_id", run_id)})
