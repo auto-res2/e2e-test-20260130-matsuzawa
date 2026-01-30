@@ -825,5 +825,166 @@
     "experimental_code": "import torch\nimport torch.nn.functional as F\n\n\ndef _token_ce(logits, targets):\n    B, T, V = logits.shape\n    return F.cross_entropy(logits.reshape(B*T, V), targets.reshape(B*T), reduction='none').view(B, T)\n\n\ndef _kl_token(p_log, q_log):\n    # KL(P||Q) where inputs are log-probs\n    p = p_log.exp()\n    return (p * (p_log - q_log)).sum(dim=-1)\n\n\ndef mci_cot_loss(\n    model,\n    input_ids,                 # [B,T] full teacher-forced sequence: prompt + rationale + answer\n    rationale_mask,            # [B,T] True on rationale token positions (for targets)\n    answer_mask,               # [B,T] True on answer token positions (for targets)\n    keypoint_w=None,           # [B,T] optional\n    unk_id=0,\n    topk_influence=8,\n    low_quantile=0.5,          # fraction of rationale tokens treated as \"low influence\" for invariance\n    beta_inv=0.2,\n    gamma_budget=0.01,\n    tau_budget=1.0,            # target mean weight on rationale tokens (after normalization)\n    eps=1e-8,\n):\n    \"\"\"Meta-Causal Invariance CoT Distillation (MCI-CoT).\n\n    Returns scalar loss = answer CE + weighted rationale imitation + invariance KL + budget penalty.\n    \"\"\"\n    if keypoint_w is None:\n        keypoint_w = torch.ones_like(input_ids, dtype=torch.float32)\n\n    # next-token setup\n    x = input_ids[:, :-1]\n    y = input_ids[:, 1:]\n    rat_m = rationale_mask[:, 1:]\n    ans_m = answer_mask[:, 1:]\n    kp_w = keypoint_w[:, 1:]\n\n    logits = model(x)  # [B,T-1,V]\n    ce = _token_ce(logits, y)  # [B,T-1]\n\n    # base answer loss (always on)\n    ans_loss = (ce * ans_m.float()).sum() / (ans_m.float().sum() + eps)\n\n    # student uncertainty u_t = 1 - p(y_t)\n    with torch.no_grad():\n        logp = F.log_softmax(logits, dim=-1)\n        pt = logp.gather(-1, y.unsqueeze(-1)).squeeze(-1).exp()\n        u = (1.0 - pt).clamp(0.0, 1.0)\n\n        orig_ans_nll = (ce * ans_m.float()).sum(dim=1)  # [B]\n\n        # candidate rationale tokens for influence estimation: top-k uncertain among rationale\n        u_rat = u.masked_fill(~rat_m, -1e9)\n        k = min(topk_influence, u_rat.size(1))\n        idx = torch.topk(u_rat, k=k, dim=1).indices  # [B,k]\n\n    # influence values (only filled at selected indices)\n    influence = torch.zeros_like(u)\n\n    B, Tm1 = y.shape\n    for j in range(idx.size(1)):\n        t_idx = idx[:, j]  # [B]\n        x_corr = x.clone()\n        x_corr[torch.arange(B, device=x.device), t_idx] = unk_id\n\n        with torch.no_grad():\n            logits_corr = model(x_corr)\n            ce_corr = _token_ce(logits_corr, y)\n            corr_ans_nll = (ce_corr * ans_m.float()).sum(dim=1)\n            delta = (corr_ans_nll - orig_ans_nll).clamp(min=0.0)\n\n        influence[torch.arange(B, device=x.device), t_idx] = delta\n\n    # normalize influence within-example\n    with torch.no_grad():\n        infl_mean = (influence * rat_m.float()).sum(dim=1) / (rat_m.float().sum(dim=1) + eps)\n        infl_norm = (influence / (infl_mean.unsqueeze(1) + eps)).clamp(0.0, 5.0)\n\n        # raw positive weights\n        r = kp_w * u * infl_norm\n        r_rat = r.masked_fill(~rat_m, 0.0)\n        mean_r = (r_rat.sum(dim=1) / (rat_m.float().sum(dim=1) + eps)).unsqueeze(1)\n        alpha = (r / (mean_r + eps)).masked_fill(~rat_m, 0.0)  # normalized\n\n    # weighted rationale imitation (positive supervision)\n    rat_loss = (alpha * ce * rat_m.float()).sum() / (alpha * rat_m.float()).sum().clamp(min=eps)\n\n    # budget regularizer to keep attention selective/stable\n    with torch.no_grad():\n        alpha_mean = (alpha * rat_m.float()).sum(dim=1) / (rat_m.float().sum(dim=1) + eps)\n    budget_loss = ((alpha_mean - tau_budget) ** 2).mean()\n\n    # --- invariance loss: corrupt low-influence rationale tokens all-at-once ---\n    # choose low-influence set per example based on alpha quantile (excluding non-rationale positions)\n    with torch.no_grad():\n        alpha_rat = alpha.masked_fill(~rat_m, 1e9)  # non-rationale won't be selected as low\n        # approximate quantile via topk of smallest values among rationale\n        rat_counts = rat_m.float().sum(dim=1).clamp(min=1).long()  # [B]\n        m = torch.clamp((rat_counts.float() * low_quantile).long(), min=1)\n\n        low_mask = torch.zeros_like(rat_m)\n        for b in range(B):\n            # get indices of smallest alpha within rationale\n            vals = alpha[b].masked_fill(~rat_m[b], 1e9)\n            _, low_idx = torch.topk(-vals, k=int(m[b].item()))  # largest of (-vals) => smallest vals\n            low_mask[b, low_idx] = True\n\n    x_junk = x.clone()\n    x_junk[low_mask] = unk_id\n\n    logits_junk = model(x_junk)\n    logp_junk = F.log_softmax(logits_junk, dim=-1)\n\n    # KL on answer token distributions (detach orig to avoid collapse)\n    with torch.no_grad():\n        logp_orig_det = F.log_softmax(logits, dim=-1)\n\n    kl_tok = _kl_token(logp_orig_det, logp_junk)  # [B,T-1]\n    inv_loss = (kl_tok * ans_m.float()).sum() / (ans_m.float().sum() + eps)\n\n    return ans_loss + rat_loss + beta_inv * inv_loss + gamma_budget * budget_loss\n",
     "expected_result": "**Synthetic Arithmetic-with-Fluff+Noise (same model/steps):**\n- A Uniform CE: accuracy 88–91% (OOD irrelevant-number: 72–78%)\n- C UF-KCoT: accuracy 93–95% (OOD: 82–86%)\n- D CI-UF-KCoT: accuracy 95–97% (OOD: 86–90%)\n- **E MCI-CoT (ours): accuracy 96.5–98% (OOD: 90–94%)**\n\nSecondary expectations (E vs D):\n- Fluff-token imitation rate: −25% to −45% relative\n- Numeric distraction susceptibility: −20% to −35% relative error rate\n- Answer invariance KL under synthetic junking: −30% to −50%\n- Rationale length when generating CoT: −10% to −25%\n\n**GSM8K (500 train / 200 dev, LoRA if available):**\n- Expect +1.0 to +2.0 absolute accuracy over CI-UF-KCoT, with larger gains on items whose teacher CoTs contain redundant prose or extra numerals.\n\n(Higher accuracy is better; lower OOD drop / KL / fluff imitation is better.)",
     "expected_conclusion": "MCI-CoT strengthens consequence-aware CoT distillation by adding two human-inspired components that prior token-weighting methods lack:\n1) **Counterfactual invariance training**: explicitly teaches the student that non-decision-critical rationale content should not change the answer distribution, reducing overfitting to persuasive but content-free explanations and improving robustness to style shifts and distractor numerals.\n2) **Minimal-sufficient budget regularization**: turns noisy causal influence estimates into a stable, metacognitive “attention budget,” better matching human selective effort allocation.\n\nAcademically, this reframes CoT distillation as *positive causal credit assignment + negative invariance constraints*, bridging attribution-style counterfactuals with representation robustness in a single training-time objective. Socially, it reduces incentives for models to learn and reproduce verbose rationales that sound convincing but are not causally tied to correctness, improving trustworthiness and lowering compute via shorter rationales. The hypothesis remains highly testable with a single PyTorch training script and synthetic data generation."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: train a causal language model to solve grade-school math word problems by producing a final numeric answer, while optionally emitting a chain-of-thought (CoT) rationale. We test whether the proposed Meta-Causal Invariance CoT Distillation (MCI-CoT) yields higher answer accuracy and greater robustness when rationale text is corrupted with stylistic fluff or irrelevant-number distractions.\n\nWorkflow:\n1) Data preparation (GSM8K): use a compute-feasible subset (e.g., 2,000 train / 500 dev / 1,000 test from the official splits). For each example, build a teacher-forced sequence: [question prompt] + [teacher CoT rationale] + [final answer].\n2) Teacher CoT creation: generate one teacher rationale per training example using the same base model in “thinking” mode (self-distillation) and cache it to disk; then strip to a bounded length (e.g., max 256 rationale tokens) and keep the final answer span separate.\n3) Fine-tuning (student): LoRA fine-tune the base LM with one of two losses (baseline CI-UF-KCoT vs proposed MCI-CoT). Both always include an unweighted answer-span CE loss to prevent “ignore rationale” collapse.\n4) Online influence estimation: during training, for top-k uncertain rationale tokens, compute a detached influence score via controlled token corruption and measuring delta answer NLL; this supplies positive credit assignment.\n5) New components (MCI-CoT only): (a) a per-example minimal-sufficient sparsity budget regularizer that discourages spreading imitation mass across many rationale tokens; (b) a counterfactual invariance objective that corrupts the low-influence rationale subset in one shot and minimizes KL divergence between original vs junked answer distributions.\n6) Evaluation: report accuracy on the clean test set and on OOD test-time perturbations (extra fluff text, irrelevant-number clauses) applied to the rationale portion (for invariance metrics) and/or prompt (for robustness).\n\nRunner fit: all training is single-GPU (A100/H200 80GB+) with LoRA, mixed precision (bf16), sequence length ≤1024, and a small GSM8K subset. Influence estimation uses small top-k (4–8) and the invariance loss adds only one extra forward pass per batch, keeping overhead modest. Optuna trials are capped and can be run sequentially on the same GPU.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: a prediction is correct if the model’s extracted final numeric answer matches the ground-truth GSM8K answer after normalization (remove commas, currency symbols, trailing periods, and whitespace; convert to canonical decimal/integer string; accept exact numeric equality). If the dataset answer is an integer, accept predictions that parse to the same integer; if a decimal, require exact decimal match after removing trailing zeros.\n\nCalculation method: accuracy = (1/N) * Σ_i 1[normalize(pred_i)==normalize(gold_i)], where pred_i is obtained by greedy decoding (or temperature=0) and extracting the last number in the output (recommended rule used in many GSM8K evaluations).\n\nTask appropriateness: GSM8K is a final-answer math benchmark; exact numeric correctness is the primary objective.\n\nRelevant visualizations: (1) learning curves of dev accuracy vs steps; (2) bar chart of accuracy by problem length bucket (question token length); (3) histogram of absolute numeric error for incorrect cases (optional, computed on parsed floats when possible)."
+      },
+      {
+        "name": "OOD_accuracy_drop",
+        "description": "Correctness criteria: same as accuracy, but evaluated under predefined out-of-distribution (OOD) perturbations.\n\nCalculation method: For each perturbation type p, compute accuracy_clean and accuracy_ood(p). Report drop(p)=accuracy_clean-accuracy_ood(p). Aggregate as mean_drop = (1/|P|) Σ_p drop(p).\n\nPerturbations (must be deterministic given a seed):\n- Prompt-fluff: append 1–2 sentences of irrelevant polite/fluffy text to the question.\n- Prompt-irrelevant-numbers: append a clause containing extra numbers/units unrelated to the asked quantity.\n\nTask appropriateness: tests robustness to nuisance text and distractor numerals, matching the hypothesis that MCI-CoT teaches invariance to non-causal rationale/prompt content.\n\nRelevant visualizations: grouped bar chart of clean vs each OOD accuracy; line plot of accuracy vs perturbation strength (e.g., number of added distractor numerals)."
+      },
+      {
+        "name": "Answer_invariance_KL",
+        "description": "Correctness criteria: lower KL indicates the model’s answer-token predictive distribution is stable when low-influence rationale tokens are jointly corrupted.\n\nCalculation method:\nFor each held-out example, compute two teacher-forced forward passes over the same target answer span:\n- Original: p_orig(y_i | prefix_i)\n- Junked: p_junk(y_i | prefix_i_junk), where prefix_i_junk is formed by replacing the identified low-influence rationale tokens with [UNK] (or a reserved corruption token).\nThen compute tokenwise KL and average over answer tokens:\nKL_i = (1/|A_i|) Σ_{t∈A_i} KL( stopgrad(p_orig^t) || p_junk^t ).\nReport dataset mean: (1/N) Σ_i KL_i.\n\nTask appropriateness: directly measures the claimed property (answer distribution invariance to low-influence rationale content) rather than relying only on downstream accuracy.\n\nRelevant visualizations: violin/box plot of per-example KL; scatter plot of KL vs correctness (correct/incorrect) to see if invariance correlates with accuracy."
+      },
+      {
+        "name": "Numeric_distraction_error_rate",
+        "description": "Correctness criteria: an example counts as a distraction failure if it becomes incorrect under an irrelevant-number perturbation while being correct on the clean version.\n\nCalculation method:\nLet C be the set of examples correct on clean. For a fixed irrelevant-number perturbation, compute error_rate = (1/|C|) Σ_{i∈C} 1[ pred_ood(i) != gold(i) ].\n\nTask appropriateness: isolates susceptibility to added numerals/quantities, which is a core failure mode targeted by invariance training.\n\nRelevant visualizations: bar chart of error_rate across perturbation strengths (0,1,2,3 added numerals)."
+      },
+      {
+        "name": "Generated_rationale_length",
+        "description": "Correctness criteria: shorter is not automatically better; interpret alongside accuracy. Measures whether methods reduce verbose/fluff imitation.\n\nCalculation method: On a rationale-required prompt (e.g., \"Explain then answer.\"), decode with fixed max_new_tokens and temperature=0. Count the number of tokens between the rationale start marker (e.g., \"Let's think\") and the answer marker (e.g., \"Answer:\"). Report mean and median length.\n\nTask appropriateness: the hypothesis predicts MCI-CoT produces shorter, more minimal-sufficient reasoning traces.\n\nRelevant visualizations: histogram of rationale lengths; scatter plot of length vs correctness."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-1.7B (1.7B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "Meta-Causal Invariance CoT Distillation (MCI-CoT)",
+      "description": "A drop-in CoT distillation loss that combines (1) student-conditional online causal influence estimation (token corruption impact on answer NLL) and uncertainty/keypoint weighting for positive credit assignment, with two new components: (2) a minimal-sufficient sparsity budget that normalizes/caps total imitation mass on rationale tokens per example to stabilize noisy influence signals, and (3) a counterfactual answer-invariance objective that jointly corrupts low-influence rationale tokens and minimizes KL divergence between original vs junked answer distributions on the answer span. This explicitly trains the student to ignore non-decision-critical rationale content.",
+      "training_config": {
+        "learning_rate": 0.0002,
+        "batch_size": 16,
+        "epochs": 3,
+        "optimizer": "adamw",
+        "warmup_steps": 200,
+        "weight_decay": 0.01,
+        "gradient_clip": 1.0,
+        "scheduler": "cosine",
+        "seed": 42,
+        "additional_params": "{\n  \"finetune\": \"LoRA\",\n  \"lora_r\": 16,\n  \"lora_alpha\": 32,\n  \"lora_dropout\": 0.05,\n  \"target_modules\": [\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\"],\n  \"precision\": \"bf16\",\n  \"max_seq_len\": 1024,\n  \"train_subset\": {\"train\": 2000, \"dev\": 500},\n  \"teacher_cot\": {\n    \"generation\": \"self-distillation from same base model\",\n    \"max_new_tokens_rationale\": 256,\n    \"temperature\": 0.7,\n    \"top_p\": 0.9,\n    \"seed\": 123\n  },\n  \"mci_cot\": {\n    \"unk_id\": \"tokenizer.unk_token_id\",\n    \"topk_influence\": 8,\n    \"low_quantile\": 0.5,\n    \"beta_inv\": 0.2,\n    \"gamma_budget\": 0.01,\n    \"tau_budget\": 1.0,\n    \"influence_corruption\": \"replace selected token(s) with [UNK]\",\n    \"exclude_from_low_set\": \"digits/operators if using simple regex-based keypoints\"\n  },\n  \"grad_accum_steps\": 8,\n  \"eval_every_steps\": 200\n}"
+      },
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 12,
+        "search_spaces": [
+          {
+            "param_name": "beta_inv",
+            "distribution_type": "loguniform",
+            "low": 0.03,
+            "high": 0.6
+          },
+          {
+            "param_name": "gamma_budget",
+            "distribution_type": "loguniform",
+            "low": 0.001,
+            "high": 0.1
+          },
+          {
+            "param_name": "topk_influence",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              6,
+              8
+            ]
+          },
+          {
+            "param_name": "low_quantile",
+            "distribution_type": "categorical",
+            "choices": [
+              0.3,
+              0.5,
+              0.7
+            ]
+          },
+          {
+            "param_name": "learning_rate",
+            "distribution_type": "loguniform",
+            "low": 5e-05,
+            "high": 0.0005
+          },
+          {
+            "param_name": "lora_r",
+            "distribution_type": "categorical",
+            "choices": [
+              8,
+              16,
+              32
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "CI-UF-KCoT (baseline)",
+        "description": "Consequence-Influence × Uncertainty (× optional keypoints) token-weighted CoT distillation: estimate per-token influence via leave-one-out corruption delta on answer NLL, multiply by student uncertainty (and optional heuristic keypoint weights), and use the resulting weights to scale rationale imitation loss. No explicit counterfactual invariance objective and no minimal-sufficient budget regularizer; serves as the strongest prior token-reweighting baseline aligned with the hypothesis statement.",
+        "training_config": {
+          "learning_rate": 0.0002,
+          "batch_size": 16,
+          "epochs": 3,
+          "optimizer": "adamw",
+          "warmup_steps": 200,
+          "weight_decay": 0.01,
+          "gradient_clip": 1.0,
+          "scheduler": "cosine",
+          "seed": 42,
+          "additional_params": "{\n  \"finetune\": \"LoRA\",\n  \"lora_r\": 16,\n  \"lora_alpha\": 32,\n  \"lora_dropout\": 0.05,\n  \"target_modules\": [\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\"],\n  \"precision\": \"bf16\",\n  \"max_seq_len\": 1024,\n  \"train_subset\": {\"train\": 2000, \"dev\": 500},\n  \"teacher_cot\": {\n    \"generation\": \"self-distillation from same base model\",\n    \"max_new_tokens_rationale\": 256,\n    \"temperature\": 0.7,\n    \"top_p\": 0.9,\n    \"seed\": 123\n  },\n  \"ci_uf_kcot\": {\n    \"unk_id\": \"tokenizer.unk_token_id\",\n    \"topk_influence\": 8,\n    \"use_keypoints\": true,\n    \"keypoint_heuristic\": \"upweight digits and arithmetic operators in the rationale\",\n    \"influence_corruption\": \"replace selected token with [UNK]\"\n  },\n  \"grad_accum_steps\": 8,\n  \"eval_every_steps\": 200\n}"
+        },
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 12,
+          "search_spaces": [
+            {
+              "param_name": "topk_influence",
+              "distribution_type": "categorical",
+              "choices": [
+                4,
+                6,
+                8
+              ]
+            },
+            {
+              "param_name": "learning_rate",
+              "distribution_type": "loguniform",
+              "low": 5e-05,
+              "high": 0.0005
+            },
+            {
+              "param_name": "lora_r",
+              "distribution_type": "categorical",
+              "choices": [
+                8,
+                16,
+                32
+              ]
+            },
+            {
+              "param_name": "use_keypoints",
+              "distribution_type": "categorical",
+              "choices": [
+                0,
+                1
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
