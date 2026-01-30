@@ -88,6 +88,7 @@ def load_run_config(cfg: DictConfig) -> DictConfig:
     if not run_path.exists():
         raise FileNotFoundError(f"Run config not found: {run_path}")
     run_cfg = OmegaConf.load(run_path)
+    OmegaConf.set_struct(cfg, False)
     merged = OmegaConf.merge(cfg, run_cfg)
     merged.run_name = run_id
     merged.run = OmegaConf.create({"run_id": run_cfg.get("run_id", run_id)})
