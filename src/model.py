@@ -430,7 +430,7 @@ def token_kl(p_log: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
 
 
 def compute_keypoint_mask(token_ids: torch.Tensor, tokenizer) -> torch.Tensor:
-    tokens = tokenizer.convert_ids_to_tokens(token_ids.view(-1).tolist()) if hasattr(tokenizer, "convert_ids_to_tokens") else []
+    tokens = tokenizer.convert_ids_to_tokens(token_ids.reshape(-1).tolist()) if hasattr(tokenizer, "convert_ids_to_tokens") else []
     if not tokens:
         return torch.zeros_like(token_ids, dtype=torch.bool)
     mask = []
@@ -442,7 +442,7 @@ def compute_keypoint_mask(token_ids: torch.Tensor, tokenizer) -> torch.Tensor:
             mask.append(True)
         else:
             mask.append(False)
-    return torch.tensor(mask, device=token_ids.device).view(token_ids.shape)
+    return torch.tensor(mask, device=token_ids.device).reshape(token_ids.shape)
 
 
 def compute_keypoint_weights(token_ids: torch.Tensor, tokenizer, weight: float = 1.5) -> torch.Tensor:
