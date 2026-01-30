@@ -1,0 +1,26 @@
+run: null
+run_id: null
+results_dir: ./results
+mode: full
+
+method: null
+model: {}
+dataset: {}
+training: {}
+optuna: {}
+
+wandb:
+  entity: airas
+  project: 2026-01-30
+  mode: online  # Automatically set to "disabled" in trial_mode
+
+evaluation:
+  max_eval_batches: null
+  rationale_eval_samples: 100
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

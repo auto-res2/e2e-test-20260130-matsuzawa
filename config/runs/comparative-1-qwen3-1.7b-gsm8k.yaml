@@ -1,0 +1,61 @@
+run_id: comparative-1-qwen3-1.7b-gsm8k
+method: CI-UF-KCoT (baseline)
+model:
+  name: Qwen3-1.7B (1.7B parameters)
+  finetune: LoRA
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+  precision: bf16
+dataset:
+  name: gsm8k
+  preprocessing:
+    max_seq_len: 1024
+    teacher_cot:
+      generation: self-distillation from same base model
+      max_new_tokens_rationale: 256
+      temperature: 0.7
+      top_p: 0.9
+      seed: 123
+  splits:
+    train: 2000
+    dev: 500
+    test: 1000
+training:
+  learning_rate: 0.0002
+  batch_size: 16
+  epochs: 3
+  optimizer: adamw
+  warmup_steps: 200
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  scheduler: cosine
+  seed: 42
+  grad_accum_steps: 8
+  eval_every_steps: 200
+  loss:
+    name: ci_uf_kcot
+    ci_uf_kcot:
+      unk_id: tokenizer.unk_token_id
+      topk_influence: 8
+      use_keypoints: true
+      keypoint_heuristic: upweight digits and arithmetic operators in the rationale
+      influence_corruption: replace selected token with [UNK]
+optuna:
+  n_trials: 12
+  search_spaces:
+    - param_name: topk_influence
+      distribution_type: categorical
+      choices: [4, 6, 8]
+    - param_name: learning_rate
+      distribution_type: loguniform
+      low: 5e-05
+      high: 0.0005
+    - param_name: lora_r
+      distribution_type: categorical
+      choices: [8, 16, 32]
+    - param_name: use_keypoints
+      distribution_type: categorical
+      choices: [0, 1]

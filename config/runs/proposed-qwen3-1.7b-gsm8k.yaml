@@ -1,0 +1,72 @@
+run_id: proposed-qwen3-1.7b-gsm8k
+method: Meta-Causal Invariance CoT Distillation (MCI-CoT)
+model:
+  name: Qwen3-1.7B (1.7B parameters)
+  finetune: LoRA
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+  precision: bf16
+dataset:
+  name: gsm8k
+  preprocessing:
+    max_seq_len: 1024
+    teacher_cot:
+      generation: self-distillation from same base model
+      max_new_tokens_rationale: 256
+      temperature: 0.7
+      top_p: 0.9
+      seed: 123
+  splits:
+    train: 2000
+    dev: 500
+    test: 1000
+training:
+  learning_rate: 0.0002
+  batch_size: 16
+  epochs: 3
+  optimizer: adamw
+  warmup_steps: 200
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  scheduler: cosine
+  seed: 42
+  grad_accum_steps: 8
+  eval_every_steps: 200
+  loss:
+    name: mci_cot
+    mci_cot:
+      unk_id: tokenizer.unk_token_id
+      topk_influence: 8
+      low_quantile: 0.5
+      beta_inv: 0.2
+      gamma_budget: 0.01
+      tau_budget: 1.0
+      influence_corruption: replace selected token(s) with [UNK]
+      exclude_from_low_set: digits/operators if using simple regex-based keypoints
+optuna:
+  n_trials: 12
+  search_spaces:
+    - param_name: beta_inv
+      distribution_type: loguniform
+      low: 0.03
+      high: 0.6
+    - param_name: gamma_budget
+      distribution_type: loguniform
+      low: 0.001
+      high: 0.1
+    - param_name: topk_influence
+      distribution_type: categorical
+      choices: [4, 6, 8]
+    - param_name: low_quantile
+      distribution_type: categorical
+      choices: [0.3, 0.5, 0.7]
+    - param_name: learning_rate
+      distribution_type: loguniform
+      low: 5e-05
+      high: 0.0005
+    - param_name: lora_r
+      distribution_type: categorical
+      choices: [8, 16, 32]
