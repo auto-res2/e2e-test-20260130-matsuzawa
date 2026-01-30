@@ -289,8 +289,7 @@ def generate_teacher_rationales(
     max_tokens = int(teacher_cfg.max_new_tokens_rationale)
     batch_size = 4
     rationales: List[str] = []
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(teacher_cfg.seed))
+    torch.manual_seed(int(teacher_cfg.seed))
 
     for start in range(0, len(questions), batch_size):
         batch_questions = questions[start : start + batch_size]
@@ -312,7 +311,6 @@ def generate_teacher_rationales(
                 top_p=float(teacher_cfg.top_p),
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                generator=generator,
             )
         decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         for text, prompt in zip(decoded, prompts):
